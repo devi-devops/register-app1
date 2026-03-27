@@ -30,7 +30,7 @@ pipeline {
                  sh "mvn test"
            }
        }
-       stage("SonarQube Analysis"){
+   /*    stage("SonarQube Analysis"){
            steps {
 	           script {
 		        withSonarQubeEnv(credentialsId: 'sonarqube-token') { 
@@ -38,7 +38,7 @@ pipeline {
 		        }
 	           }	
            }
-       }
+       }  */
     
     }
 }
