@@ -14,7 +14,7 @@ pipeline {
 
         stage("Checkout from SCM"){
                 steps {
-                    git branch: 'main', credentialsId: 'devi-devops', url: 'https://github.com/devi-devops/register-app'
+                    git branch: 'main', credentialsId: 'devi-devops', url: 'https://github.com/devi-devops/register-app1'
                 }
         }
 
