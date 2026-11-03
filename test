@@ -1,0 +1,924 @@
+param (
+    [string]$RFC_LIST = $env:RFC_LIST,
+    [string]$CAB_DATE = $env:CAB_DATE,
+    [string]$DeploymentPlanFolder = $env:DEPLOYMENT_PLAN_FOLDER,
+    [string]$GitLabUrl = $env:GITLAB_URL,
+    [string]$GitLabToken = $env:GITLAB_TOKEN,
+    [string]$ReportPath = ".\RFC_Post_CAB_Changes.csv"
+)
+ 
+$ErrorActionPreference = "Stop"
+ 
+# ============================================================
+# Function: Get Eastern Time Zone
+# Works with both Windows PowerShell and PowerShell Core/Linux
+# ============================================================
+ 
+function Get-EasternTimeZone {
+ 
+    try {
+        return [System.TimeZoneInfo]::FindSystemTimeZoneById(
+            "Eastern Standard Time"
+        )
+    }
+    catch {
+        try {
+            return [System.TimeZoneInfo]::FindSystemTimeZoneById(
+                "America/New_York"
+            )
+        }
+        catch {
+            throw "Unable to find Eastern Time zone on this Jenkins agent."
+        }
+    }
+}
+ 
+ 
+# ============================================================
+# Function: Extract GitLab project path from repository URL
+#
+# Example:
+#
+# Repository URL:
+# https://gitlab.example.com/repos/ABC/CLMS_P02008.git
+#
+# Returns:
+# repos/ABC/CLMS_P02008
+# ============================================================
+ 
+function Get-GitLabProjectPath {
+ 
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$RepositoryUrl
+    )
+ 
+    try {
+        $RepoUri = [System.Uri]$RepositoryUrl
+    }
+    catch {
+        throw "Invalid repository URL: $RepositoryUrl"
+    }
+ 
+    $ProjectPath = $RepoUri.AbsolutePath.Trim("/")
+ 
+    if ($ProjectPath.EndsWith(".git")) {
+        $ProjectPath = $ProjectPath.Substring(
+            0,
+            $ProjectPath.Length - 4
+        )
+    }
+ 
+    if (:IsNullOrWhiteSpace($ProjectPath)) {
+        throw "Unable to derive GitLab project path from $RepositoryUrl"
+    }
+ 
+    return $ProjectPath
+}
+ 
+ 
+# ============================================================
+# Function: Get commits after CAB
+# No cloning is involved.
+# GitLab REST API is queried directly.
+# ============================================================
+ 
+function Get-CommitsAfterCAB {
+ 
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectPath,
+ 
+        [Parameter(Mandatory = $true)]
+        [string]$Branch,
+ 
+        [Parameter(Mandatory = $true)]
+        [string]$CabUtcIso,
+ 
+        [Parameter(Mandatory = $true)]
+        [datetime]$CabUtcDateTime
+    )
+ 
+    $EncodedProject = [System.Uri]::EscapeDataString($ProjectPath)
+    $EncodedBranch  = [System.Uri]::EscapeDataString($Branch)
+    $EncodedSince   = [System.Uri]::EscapeDataString($CabUtcIso)
+ 
+    $AllCommits = @()
+ 
+    $Page = 1
+    $PerPage = 100
+ 
+    do {
+ 
+        $ApiUrl = "$GitLabUrl/api/v4/projects/$EncodedProject/repository/commits" +
+                  "?ref_name=$EncodedBranch" +
+                  "&since=$EncodedSince" +
+                  "&per_page=$PerPage" +
+                  "&page=$Page"
+ 
+        Write-Host "    GitLab API page : $Page"
+ 
+        try {
+ 
+            $PageCommits = @(
+                Invoke-RestMethod `
+                    -Uri $ApiUrl `
+                    -Headers $Headers `
+                    -Method Get `
+                    -ContentType "application/json"
+            )
+ 
+        }
+        catch {
+ 
+            throw "GitLab API failed: $($_.Exception.Message)"
+        }
+ 
+        if ($PageCommits.Count -gt 0) {
+            $AllCommits += $PageCommits
+        }
+ 
+        $Page++
+ 
+    }
+    while ($PageCommits.Count -eq $PerPage)
+ 
+ 
+    # GitLab 'since' can include a commit exactly at the cutoff.
+    # We want strictly AFTER 09:00 AM.
+    $FilteredCommits = @(
+        $AllCommits | Where-Object {
+ 
+            $CommitDate = :Parse(
+                $_.committed_date,
+                [System.Globalization.CultureInfo]::InvariantCulture
+            )
+ 
+            $CommitDate.UtcDateTime -gt $CabUtcDateTime
+        }
+    )
+ 
+    return $FilteredCommits
+}
+ 
+ 
+# ============================================================
+# Validate Jenkins parameters
+# ============================================================
+ 
+if (:IsNullOrWhiteSpace($RFC_LIST)) {
+ 
+    throw @"
+RFC_LIST is empty.
+ 
+Example:
+CHG108943,CHG108944,CHG108945
+"@
+}
+ 
+ 
+if (:IsNullOrWhiteSpace($DeploymentPlanFolder)) {
+ 
+    throw "DEPLOYMENT_PLAN_FOLDER is required."
+}
+ 
+ 
+if (-not (Test-Path -LiteralPath $DeploymentPlanFolder)) {
+ 
+    throw "Deployment Plan folder does not exist: $DeploymentPlanFolder"
+}
+ 
+ 
+if (:IsNullOrWhiteSpace($GitLabUrl)) {
+ 
+    throw "GITLAB_URL is required."
+}
+ 
+ 
+if (:IsNullOrWhiteSpace($GitLabToken)) {
+ 
+    throw "GITLAB_TOKEN is required."
+}
+ 
+ 
+$GitLabUrl = $GitLabUrl.TrimEnd("/")
+ 
+ 
+# ============================================================
+# GitLab Authentication
+# ============================================================
+ 
+$Headers = @{
+    "PRIVATE-TOKEN" = $GitLabToken
+}
+ 
+ 
+# ============================================================
+# Calculate CAB cutoff
+# ============================================================
+ 
+$EasternTimeZone = Get-EasternTimeZone
+ 
+ 
+# Current date in Eastern Time
+$UtcNow = :UtcNow
+ 
+$EasternNow = [System.TimeZoneInfo]::ConvertTimeFromUtc(
+    $UtcNow,
+    $EasternTimeZone
+)
+ 
+ 
+if (:IsNullOrWhiteSpace($CAB_DATE)) {
+ 
+    $CabDateOnly = $EasternNow.Date
+ 
+    Write-Host ""
+    Write-Host "CAB_DATE was not provided."
+    Write-Host "Using today's Eastern date:"
+    Write-Host $CabDateOnly.ToString("yyyy-MM-dd")
+ 
+}
+else {
+ 
+    try {
+ 
+        $CabDateOnly = :ParseExact(
+            $CAB_DATE.Trim(),
+            "yyyy-MM-dd",
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+ 
+    }
+    catch {
+ 
+        throw "CAB_DATE must be in yyyy-MM-dd format. Example: 2026-11-03"
+    }
+}
+ 
+ 
+# CAB time is always 9 AM Eastern
+$CabEasternTime = :SpecifyKind(
+    $CabDateOnly.Date.AddHours(9),
+    :Unspecified
+)
+ 
+ 
+# Convert CAB Eastern Time to UTC
+$CabUtcDateTime = [System.TimeZoneInfo]::ConvertTimeToUtc(
+    $CabEasternTime,
+    $EasternTimeZone
+)
+ 
+ 
+$CabUtcIso = $CabUtcDateTime.ToString(
+    "yyyy-MM-ddTHH:mm:ssZ"
+)
+ 
+ 
+Write-Host ""
+Write-Host "======================================================"
+Write-Host " CAB VALIDATION"
+Write-Host "======================================================"
+Write-Host "CAB Date             : $($CabDateOnly.ToString('yyyy-MM-dd'))"
+Write-Host "CAB Time             : 09:00 AM Eastern"
+Write-Host "CAB Eastern DateTime : $CabEasternTime"
+Write-Host "CAB UTC DateTime     : $CabUtcIso"
+Write-Host "======================================================"
+Write-Host ""
+ 
+ 
+# ============================================================
+# Convert RFC_LIST to array
+#
+# Accepts:
+# CHG1,CHG2,CHG3
+#
+# Also accepts new lines or semicolons.
+# ============================================================
+ 
+$RFCs = @(
+    $RFC_LIST -split "[,;`r`n]+" |
+        ForEach-Object {
+            $_.Trim()
+        } |
+        Where-Object {
+            -not :IsNullOrWhiteSpace($_)
+        } |
+        Select-Object -Unique
+)
+ 
+ 
+Write-Host "RFCs to process:"
+$RFCs | ForEach-Object {
+    Write-Host "  $_"
+}
+ 
+Write-Host ""
+ 
+ 
+# ============================================================
+# Report arrays
+# ============================================================
+ 
+$Report = @()
+ 
+$ChangesDetected = $false
+$ErrorsDetected  = $false
+ 
+ 
+# ============================================================
+# Process every RFC
+# ============================================================
+ 
+foreach ($RFC in $RFCs) {
+ 
+    Write-Host ""
+    Write-Host "======================================================"
+    Write-Host "Processing RFC : $RFC"
+    Write-Host "======================================================"
+ 
+ 
+    # --------------------------------------------------------
+    # Find Deployment Plan
+    # --------------------------------------------------------
+ 
+    $ExactXml = Join-Path `
+        -Path $DeploymentPlanFolder `
+        -ChildPath "$RFC.xml"
+ 
+ 
+    if (Test-Path -LiteralPath $ExactXml) {
+ 
+        $DeploymentPlanPath = $ExactXml
+ 
+    }
+    else {
+ 
+        # Example:
+        #
+        # RFC:
+        # CHG108943
+        #
+        # XML:
+        # CHG108943.PR1005034-DG4345.xml
+ 
+        $MatchingXml = @(
+            Get-ChildItem `
+                -Path $DeploymentPlanFolder `
+                -Filter "$RFC*.xml" `
+                -File
+        )
+ 
+ 
+        if ($MatchingXml.Count -eq 0) {
+ 
+            Write-Warning "No Deployment Plan found for $RFC"
+ 
+            $Report += [PSCustomObject]@{
+ 
+                RFC                = $RFC
+                DeploymentID       = ""
+                Repository         = ""
+                ProjectPath        = ""
+                Branch             = ""
+                CABTimeEastern     = $CabEasternTime
+                CABTimeUTC         = $CabUtcIso
+                CommitsAfterCAB    = 0
+                Status             = "XML_NOT_FOUND"
+                LatestCommitSHA    = ""
+                LatestAuthor       = ""
+                LatestCommitter    = ""
+                LatestCommitDate   = ""
+                LatestCommitTitle  = ""
+                CommitWebURL       = ""
+                Error              = "Deployment Plan not found"
+            }
+ 
+            $ErrorsDetected = $true
+ 
+            continue
+        }
+ 
+ 
+        if ($MatchingXml.Count -gt 1) {
+ 
+            Write-Warning "Multiple Deployment Plans found for $RFC"
+ 
+            Write-Host "Matching files:"
+ 
+            $MatchingXml | ForEach-Object {
+                Write-Host "  $($_.Name)"
+            }
+ 
+ 
+            $Report += [PSCustomObject]@{
+ 
+                RFC                = $RFC
+                DeploymentID       = ""
+                Repository         = ""
+                ProjectPath        = ""
+                Branch             = ""
+                CABTimeEastern     = $CabEasternTime
+                CABTimeUTC         = $CabUtcIso
+                CommitsAfterCAB    = 0
+                Status             = "MULTIPLE_XML_FILES"
+                LatestCommitSHA    = ""
+                LatestAuthor       = ""
+                LatestCommitter    = ""
+                LatestCommitDate   = ""
+                LatestCommitTitle  = ""
+                CommitWebURL       = ""
+                Error              = ($MatchingXml.Name -join ", ")
+            }
+ 
+            $ErrorsDetected = $true
+ 
+            continue
+        }
+ 
+ 
+        $DeploymentPlanPath = $MatchingXml[0].FullName
+    }
+ 
+ 
+    Write-Host "Deployment Plan: $DeploymentPlanPath"
+ 
+ 
+    # --------------------------------------------------------
+    # Read XML
+    # --------------------------------------------------------
+ 
+    try {
+ 
+        [xml]$DeploymentXml = Get-Content `
+            -LiteralPath $DeploymentPlanPath `
+            -Raw
+ 
+    }
+    catch {
+ 
+        Write-Warning "Unable to read XML: $($_.Exception.Message)"
+ 
+        $Report += [PSCustomObject]@{
+ 
+            RFC                = $RFC
+            DeploymentID       = ""
+            Repository         = ""
+            ProjectPath        = ""
+            Branch             = ""
+            CABTimeEastern     = $CabEasternTime
+            CABTimeUTC         = $CabUtcIso
+            CommitsAfterCAB    = 0
+            Status             = "INVALID_XML"
+            LatestCommitSHA    = ""
+            LatestAuthor       = ""
+            LatestCommitter    = ""
+            LatestCommitDate   = ""
+            LatestCommitTitle  = ""
+            CommitWebURL       = ""
+            Error              = $_.Exception.Message
+        }
+ 
+        $ErrorsDetected = $true
+ 
+        continue
+    }
+ 
+ 
+    # --------------------------------------------------------
+    # Get Deployment ID
+    # --------------------------------------------------------
+ 
+    $DeploymentID = [string]$DeploymentXml.deployment.id
+ 
+ 
+    Write-Host "Deployment ID : $DeploymentID"
+ 
+ 
+    # --------------------------------------------------------
+    # Get all repositories from:
+    #
+    # <scm>
+    #    <repository branch="" url="" />
+    #    <repository branch="" url="" />
+    # </scm>
+    # --------------------------------------------------------
+ 
+    $Repositories = @(
+        $DeploymentXml.deployment.scm.repository
+    )
+ 
+ 
+    if ($Repositories.Count -eq 0) {
+ 
+        Write-Warning "No repositories found in Deployment Plan."
+ 
+        $Report += [PSCustomObject]@{
+ 
+            RFC                = $RFC
+            DeploymentID       = $DeploymentID
+            Repository         = ""
+            ProjectPath        = ""
+            Branch             = ""
+            CABTimeEastern     = $CabEasternTime
+            CABTimeUTC         = $CabUtcIso
+            CommitsAfterCAB    = 0
+            Status             = "NO_REPOSITORIES"
+            LatestCommitSHA    = ""
+            LatestAuthor       = ""
+            LatestCommitter    = ""
+            LatestCommitDate   = ""
+            LatestCommitTitle  = ""
+            CommitWebURL       = ""
+            Error              = "No repositories found under deployment.scm"
+        }
+ 
+        $ErrorsDetected = $true
+ 
+        continue
+    }
+ 
+ 
+    Write-Host "Repositories found: $($Repositories.Count)"
+ 
+ 
+    # ========================================================
+    # Process every repository inside RFC
+    # ========================================================
+ 
+    foreach ($Repository in $Repositories) {
+ 
+        $RepositoryUrl = [string]$Repository.url
+        $Branch        = [string]$Repository.branch
+ 
+ 
+        Write-Host ""
+        Write-Host "------------------------------------------------------"
+        Write-Host "Repository URL : $RepositoryUrl"
+        Write-Host "Branch         : $Branch"
+        Write-Host "------------------------------------------------------"
+ 
+ 
+        # ----------------------------------------------------
+        # Validate XML entry
+        # ----------------------------------------------------
+ 
+        if (
+            :IsNullOrWhiteSpace($RepositoryUrl) -or
+            :IsNullOrWhiteSpace($Branch)
+        ) {
+ 
+            Write-Warning "Repository URL or Branch is missing."
+ 
+            $Report += [PSCustomObject]@{
+ 
+                RFC                = $RFC
+                DeploymentID       = $DeploymentID
+                Repository         = ""
+                ProjectPath        = ""
+                Branch             = $Branch
+                CABTimeEastern     = $CabEasternTime
+                CABTimeUTC         = $CabUtcIso
+                CommitsAfterCAB    = 0
+                Status             = "INVALID_ENTRY"
+                LatestCommitSHA    = ""
+                LatestAuthor       = ""
+                LatestCommitter    = ""
+                LatestCommitDate   = ""
+                LatestCommitTitle  = ""
+                CommitWebURL       = ""
+                Error              = "Repository URL or Branch missing"
+            }
+ 
+            $ErrorsDetected = $true
+ 
+            continue
+        }
+ 
+ 
+        try {
+ 
+            # ------------------------------------------------
+            # Extract GitLab project path
+            # ------------------------------------------------
+ 
+            $ProjectPath = Get-GitLabProjectPath `
+                -RepositoryUrl $RepositoryUrl
+ 
+ 
+            $RepositoryName = (
+                $ProjectPath -split "/"
+            )[-1]
+ 
+ 
+            Write-Host "Project Path   : $ProjectPath"
+            Write-Host "Repository     : $RepositoryName"
+ 
+ 
+            # ------------------------------------------------
+            # Query GitLab
+            # ------------------------------------------------
+ 
+            $Commits = @(
+                Get-CommitsAfterCAB `
+                    -ProjectPath $ProjectPath `
+                    -Branch $Branch `
+                    -CabUtcIso $CabUtcIso `
+                    -CabUtcDateTime $CabUtcDateTime
+            )
+ 
+ 
+            # ------------------------------------------------
+            # Changes exist
+            # ------------------------------------------------
+ 
+            if ($Commits.Count -gt 0) {
+ 
+                $ChangesDetected = $true
+ 
+ 
+                $SortedCommits = @(
+                    $Commits |
+                        Sort-Object {
+                            :Parse(
+                                $_.committed_date
+                            )
+                        } -Descending
+                )
+ 
+ 
+                $LatestCommit = $SortedCommits[0]
+ 
+ 
+                Write-Warning "$($Commits.Count) commit(s) found AFTER CAB."
+ 
+ 
+                Write-Host ""
+                Write-Host "Commits after CAB:"
+ 
+ 
+                foreach ($Commit in $SortedCommits) {
+ 
+                    Write-Host (
+                        "  $($Commit.short_id) | " +
+                        "$($Commit.committed_date) | " +
+                        "$($Commit.committer_name) | " +
+                        "$($Commit.title)"
+                    )
+                }
+ 
+ 
+                $Report += [PSCustomObject]@{
+ 
+                    RFC                = $RFC
+ 
+                    DeploymentID       = $DeploymentID
+ 
+                    Repository         = $RepositoryName
+ 
+                    ProjectPath        = $ProjectPath
+ 
+                    Branch             = $Branch
+ 
+                    CABTimeEastern     = $CabEasternTime
+ 
+                    CABTimeUTC         = $CabUtcIso
+ 
+                    CommitsAfterCAB    = $Commits.Count
+ 
+                    Status             = "CHANGE_FOUND"
+ 
+                    LatestCommitSHA    = $LatestCommit.id
+ 
+                    LatestAuthor       = $LatestCommit.author_name
+ 
+                    LatestCommitter    = $LatestCommit.committer_name
+ 
+                    LatestCommitDate   = $LatestCommit.committed_date
+ 
+                    LatestCommitTitle  = $LatestCommit.title
+ 
+                    CommitWebURL       = $LatestCommit.web_url
+ 
+                    Error              = ""
+                }
+ 
+            }
+ 
+            # ------------------------------------------------
+            # No changes
+            # ------------------------------------------------
+ 
+            else {
+ 
+                Write-Host "No commits found after CAB."
+                Write-Host "Status: NO_CHANGE"
+ 
+ 
+                $Report += [PSCustomObject]@{
+ 
+                    RFC                = $RFC
+ 
+                    DeploymentID       = $DeploymentID
+ 
+                    Repository         = $RepositoryName
+ 
+                    ProjectPath        = $ProjectPath
+ 
+                    Branch             = $Branch
+ 
+                    CABTimeEastern     = $CabEasternTime
+ 
+                    CABTimeUTC         = $CabUtcIso
+ 
+                    CommitsAfterCAB    = 0
+ 
+                    Status             = "NO_CHANGE"
+ 
+                    LatestCommitSHA    = ""
+ 
+                    LatestAuthor       = ""
+ 
+                    LatestCommitter    = ""
+ 
+                    LatestCommitDate   = ""
+ 
+                    LatestCommitTitle  = ""
+ 
+                    CommitWebURL       = ""
+ 
+                    Error              = ""
+                }
+            }
+ 
+        }
+        catch {
+ 
+            $ErrorsDetected = $true
+ 
+            $ErrorMessage = $_.Exception.Message
+ 
+ 
+            Write-Warning "Repository validation failed."
+            Write-Warning $ErrorMessage
+ 
+ 
+            $Report += [PSCustomObject]@{
+ 
+                RFC                = $RFC
+ 
+                DeploymentID       = $DeploymentID
+ 
+                Repository         = ""
+ 
+                ProjectPath        = ""
+ 
+                Branch             = $Branch
+ 
+                CABTimeEastern     = $CabEasternTime
+ 
+                CABTimeUTC         = $CabUtcIso
+ 
+                CommitsAfterCAB    = 0
+ 
+                Status             = "API_ERROR"
+ 
+                LatestCommitSHA    = ""
+ 
+                LatestAuthor       = ""
+ 
+                LatestCommitter    = ""
+ 
+                LatestCommitDate   = ""
+ 
+                LatestCommitTitle  = ""
+ 
+                CommitWebURL       = ""
+ 
+                Error              = $ErrorMessage
+            }
+        }
+    }
+}
+ 
+ 
+# ============================================================
+# Export CSV Report
+# ============================================================
+ 
+$Report |
+    Export-Csv `
+        -Path $ReportPath `
+        -NoTypeInformation `
+        -Encoding UTF8
+ 
+ 
+# ============================================================
+# Display Final Summary
+# ============================================================
+ 
+Write-Host ""
+Write-Host ""
+Write-Host "======================================================"
+Write-Host " FINAL CAB VALIDATION SUMMARY"
+Write-Host "======================================================"
+Write-Host ""
+ 
+ 
+$Report |
+    Select-Object `
+        RFC,
+        Repository,
+        Branch,
+        CommitsAfterCAB,
+        Status |
+    Format-Table -AutoSize
+ 
+ 
+# ============================================================
+# Count results
+# ============================================================
+ 
+$ChangedRepositories = @(
+    $Report |
+        Where-Object {
+            $_.Status -eq "CHANGE_FOUND"
+        }
+)
+ 
+ 
+$NoChangeRepositories = @(
+    $Report |
+        Where-Object {
+            $_.Status -eq "NO_CHANGE"
+        }
+)
+ 
+ 
+$ValidationErrors = @(
+    $Report |
+        Where-Object {
+            $_.Status -in @(
+                "XML_NOT_FOUND",
+                "MULTIPLE_XML_FILES",
+                "INVALID_XML",
+                "NO_REPOSITORIES",
+                "INVALID_ENTRY",
+                "API_ERROR"
+            )
+        }
+)
+ 
+ 
+Write-Host ""
+Write-Host "CAB Date             : $($CabDateOnly.ToString('yyyy-MM-dd'))"
+Write-Host "CAB Cutoff           : 09:00 AM Eastern"
+Write-Host ""
+Write-Host "Repositories Checked : $($ChangedRepositories.Count + $NoChangeRepositories.Count)"
+Write-Host "No Change            : $($NoChangeRepositories.Count)"
+Write-Host "Change Found         : $($ChangedRepositories.Count)"
+Write-Host "Validation Errors    : $($ValidationErrors.Count)"
+Write-Host ""
+Write-Host "CSV Report           : $ReportPath"
+Write-Host ""
+ 
+ 
+# ============================================================
+# Final Build Result
+# ============================================================
+ 
+if ($ValidationErrors.Count -gt 0) {
+ 
+    Write-Error (
+        "CAB validation completed with errors. " +
+        "Review the CSV report."
+    )
+ 
+    exit 2
+}
+ 
+ 
+if ($ChangedRepositories.Count -gt 0) {
+ 
+    Write-Warning ""
+    Write-Warning "***********************************************"
+    Write-Warning " CHANGES DETECTED AFTER CAB APPROVAL"
+    Write-Warning "***********************************************"
+    Write-Warning ""
+    Write-Warning "Review the affected RFC repositories before PROD deployment."
+    Write-Warning ""
+ 
+    # Basic tracking only:
+    # Do NOT fail Jenkins just because changes were detected.
+    exit 0
+}
+ 
+ 
+Write-Host ""
+Write-Host "***********************************************"
+Write-Host " NO CHANGES DETECTED AFTER CAB APPROVAL"
+Write-Host "***********************************************"
+Write-Host ""
+ 
+exit 0
