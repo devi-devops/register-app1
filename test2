@@ -1,0 +1,475 @@
+# ============================================================
+# Encounters - Unauthorized Merge Request Auto-Close
+#
+# Rule:
+#   If Target Branch = integration/main
+#   AND MR Creator != Approved Service ID
+#   THEN:
+#       1. Add comment to MR
+#       2. Close MR
+#
+# Intended to run from Jenkins on a schedule.
+# ============================================================
+ 
+# -----------------------------
+# Configuration
+# -----------------------------
+ 
+$GitLabUrl = "https://gitlab.yourcompany.com"
+ 
+# Encounters Group ID
+$GroupId = "12345"
+ 
+# Service account username used by merge automation
+$ServiceAccount = "your_service_id"
+ 
+# GitLab token
+$GitLabToken = $env:GITLAB_TOKEN
+ 
+# Branches where only Service ID can create MRs
+$ProtectedTargetBranches = @(
+    "integration",
+    "main"
+)
+ 
+# -----------------------------
+# Validate configuration
+# -----------------------------
+ 
+if ([string]::IsNullOrWhiteSpace($GitLabToken)) {
+    Write-Error "GITLAB_TOKEN environment variable is not configured."
+    exit 1
+}
+ 
+$Headers = @{
+    "PRIVATE-TOKEN" = $GitLabToken
+}
+ 
+# -----------------------------
+# Counters
+# -----------------------------
+ 
+$ProjectsChecked = 0
+$MRsChecked      = 0
+$MRsClosed       = 0
+$Errors          = 0
+ 
+ 
+# ============================================================
+# Function: Get all group projects
+# Includes projects from subgroups
+# ============================================================
+ 
+function Get-GitLabGroupProjects {
+ 
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$GroupId
+    )
+ 
+    $Projects = @()
+    $Page = 1
+    $PerPage = 100
+ 
+    do {
+ 
+        $Url = "$GitLabUrl/api/v4/groups/$GroupId/projects" +
+               "?include_subgroups=true" +
+               "&per_page=$PerPage" +
+               "&page=$Page"
+ 
+        Write-Host "Fetching projects - Page $Page"
+ 
+        try {
+ 
+            $Response = Invoke-RestMethod `
+                -Method Get `
+                -Uri $Url `
+                -Headers $Headers `
+                -ErrorAction Stop
+ 
+            if ($null -ne $Response) {
+                $Projects += @($Response)
+            }
+ 
+            $Count = @($Response).Count
+ 
+            $Page++
+ 
+        }
+        catch {
+ 
+            Write-Error "Failed to retrieve projects from group $GroupId"
+            Write-Error $_.Exception.Message
+ 
+            throw
+        }
+ 
+    }
+    while ($Count -eq $PerPage)
+ 
+    return $Projects
+}
+ 
+ 
+# ============================================================
+# Function: Get all OPEN Merge Requests for project
+# ============================================================
+ 
+function Get-OpenMergeRequests {
+ 
+    param (
+        [Parameter(Mandatory = $true)]
+        [int]$ProjectId
+    )
+ 
+    $MergeRequests = @()
+    $Page = 1
+    $PerPage = 100
+ 
+    do {
+ 
+        $Url = "$GitLabUrl/api/v4/projects/$ProjectId/merge_requests" +
+               "?state=opened" +
+               "&scope=all" +
+               "&per_page=$PerPage" +
+               "&page=$Page"
+ 
+        try {
+ 
+            $Response = Invoke-RestMethod `
+                -Method Get `
+                -Uri $Url `
+                -Headers $Headers `
+                -ErrorAction Stop
+ 
+            if ($null -ne $Response) {
+                $MergeRequests += @($Response)
+            }
+ 
+            $Count = @($Response).Count
+ 
+            $Page++
+ 
+        }
+        catch {
+ 
+            Write-Warning "Unable to retrieve MRs for Project ID: $ProjectId"
+            Write-Warning $_.Exception.Message
+ 
+            throw
+        }
+ 
+    }
+    while ($Count -eq $PerPage)
+ 
+    return $MergeRequests
+}
+ 
+ 
+# ============================================================
+# Function: Add comment to Merge Request
+# ============================================================
+ 
+function Add-MergeRequestComment {
+ 
+    param (
+        [Parameter(Mandatory = $true)]
+        [int]$ProjectId,
+ 
+        [Parameter(Mandatory = $true)]
+        [int]$MergeRequestIid,
+ 
+        [Parameter(Mandatory = $true)]
+        [string]$Comment
+    )
+ 
+    $Url = "$GitLabUrl/api/v4/projects/$ProjectId/merge_requests/$MergeRequestIid/notes"
+ 
+    $Body = @{
+        body = $Comment
+    }
+ 
+    try {
+ 
+        Invoke-RestMethod `
+            -Method Post `
+            -Uri $Url `
+            -Headers $Headers `
+            -Body $Body `
+            -ErrorAction Stop | Out-Null
+ 
+        Write-Host "Comment added to MR !$MergeRequestIid"
+    }
+    catch {
+ 
+        # Comment failure should NOT prevent MR from being closed.
+ 
+        Write-Warning "Unable to add comment to MR !$MergeRequestIid"
+        Write-Warning $_.Exception.Message
+    }
+}
+ 
+ 
+# ============================================================
+# Function: Close Merge Request
+# ============================================================
+ 
+function Close-MergeRequest {
+ 
+    param (
+        [Parameter(Mandatory = $true)]
+        [int]$ProjectId,
+ 
+        [Parameter(Mandatory = $true)]
+        [int]$MergeRequestIid
+    )
+ 
+    $Url = "$GitLabUrl/api/v4/projects/$ProjectId/merge_requests/$MergeRequestIid"
+ 
+    $Body = @{
+        state_event = "close"
+    }
+ 
+    Invoke-RestMethod `
+        -Method Put `
+        -Uri $Url `
+        -Headers $Headers `
+        -Body $Body `
+        -ErrorAction Stop | Out-Null
+}
+ 
+ 
+# ============================================================
+# MAIN
+# ============================================================
+ 
+Write-Host ""
+Write-Host "============================================================"
+Write-Host " Encounters Merge Request Governance"
+Write-Host "============================================================"
+Write-Host ""
+ 
+Write-Host "Group ID            : $GroupId"
+Write-Host "Service Account     : $ServiceAccount"
+Write-Host "Protected Targets   : $($ProtectedTargetBranches -join ', ')"
+Write-Host ""
+ 
+ 
+# -----------------------------
+# Retrieve projects
+# -----------------------------
+ 
+try {
+ 
+    $Projects = @(Get-GitLabGroupProjects -GroupId $GroupId)
+ 
+}
+catch {
+ 
+    Write-Error "Unable to retrieve Encounters projects."
+    exit 1
+}
+ 
+ 
+Write-Host ""
+Write-Host "Total projects found: $($Projects.Count)"
+Write-Host ""
+ 
+ 
+# -----------------------------
+# Process each repository
+# -----------------------------
+ 
+foreach ($Project in $Projects) {
+ 
+    $ProjectsChecked++
+ 
+    $ProjectId   = $Project.id
+    $ProjectName = $Project.path_with_namespace
+ 
+    Write-Host ""
+    Write-Host "------------------------------------------------------------"
+    Write-Host "Repository : $ProjectName"
+    Write-Host "Project ID : $ProjectId"
+    Write-Host "------------------------------------------------------------"
+ 
+    try {
+ 
+        $MergeRequests = @(Get-OpenMergeRequests -ProjectId $ProjectId)
+ 
+    }
+    catch {
+ 
+        $Errors++
+ 
+        Write-Warning "Skipping repository because MRs could not be retrieved."
+        continue
+    }
+ 
+ 
+    if ($MergeRequests.Count -eq 0) {
+ 
+        Write-Host "No open Merge Requests."
+ 
+        continue
+    }
+ 
+ 
+    Write-Host "Open MRs: $($MergeRequests.Count)"
+ 
+ 
+    # -----------------------------
+    # Process MRs
+    # -----------------------------
+ 
+    foreach ($MR in $MergeRequests) {
+ 
+        $MRsChecked++
+ 
+        $MrIid       = $MR.iid
+        $SourceBranch = $MR.source_branch
+        $TargetBranch = $MR.target_branch
+        $Author       = $MR.author.username
+        $MrTitle      = $MR.title
+        $MrUrl        = $MR.web_url
+ 
+ 
+        Write-Host ""
+        Write-Host "MR !$MrIid"
+        Write-Host "Title   : $MrTitle"
+        Write-Host "Author  : $Author"
+        Write-Host "Source  : $SourceBranch"
+        Write-Host "Target  : $TargetBranch"
+ 
+ 
+        # ====================================================
+        # RULE 1
+        #
+        # We only care about integration/main targets.
+        # ====================================================
+ 
+        if ($TargetBranch -notin $ProtectedTargetBranches) {
+ 
+            Write-Host "Result  : Allowed - target is not protected."
+ 
+            continue
+        }
+ 
+ 
+        # ====================================================
+        # RULE 2
+        #
+        # Allow Service ID created MRs.
+        # ====================================================
+ 
+        if ($Author -ieq $ServiceAccount) {
+ 
+            Write-Host "Result  : Allowed - created by approved Service ID."
+ 
+            continue
+        }
+ 
+ 
+        # ====================================================
+        # RULE 3
+        #
+        # Target = integration/main
+        # AND
+        # Author != Service ID
+        #
+        # Add comment + CLOSE MR.
+        # ====================================================
+ 
+        Write-Warning "UNAUTHORIZED MERGE REQUEST DETECTED"
+ 
+        Write-Host "Repository : $ProjectName"
+        Write-Host "MR         : !$MrIid"
+        Write-Host "Creator    : $Author"
+        Write-Host "Source     : $SourceBranch"
+        Write-Host "Target     : $TargetBranch"
+ 
+ 
+        $Comment = @"
+This merge request has been automatically closed by the Encounters merge request governance automation.
+ 
+Direct merge requests into '$TargetBranch' are permitted only when they are created by the approved DevOps service account.
+ 
+MR creator: $Author
+Source branch: $SourceBranch
+Target branch: $TargetBranch
+ 
+If this merge request was created for peer/code review, please recreate the merge request with the appropriate feature branch as the target branch.
+"@
+ 
+ 
+        # -------------------------
+        # Add comment
+        # -------------------------
+ 
+        Add-MergeRequestComment `
+            -ProjectId $ProjectId `
+            -MergeRequestIid $MrIid `
+            -Comment $Comment
+ 
+ 
+        # -------------------------
+        # Close MR
+        # -------------------------
+ 
+        try {
+ 
+            Close-MergeRequest `
+                -ProjectId $ProjectId `
+                -MergeRequestIid $MrIid
+ 
+            $MRsClosed++
+ 
+            Write-Host ""
+            Write-Host "RESULT: MR !$MrIid CLOSED"
+            Write-Host "URL   : $MrUrl"
+        }
+        catch {
+ 
+            $Errors++
+ 
+            Write-Error "Failed to close MR !$MrIid in $ProjectName"
+            Write-Error $_.Exception.Message
+        }
+    }
+}
+ 
+ 
+# ============================================================
+# Summary
+# ============================================================
+ 
+Write-Host ""
+Write-Host "============================================================"
+Write-Host " Execution Summary"
+Write-Host "============================================================"
+ 
+Write-Host "Projects checked : $ProjectsChecked"
+Write-Host "Open MRs checked : $MRsChecked"
+Write-Host "MRs closed       : $MRsClosed"
+Write-Host "Errors            : $Errors"
+ 
+Write-Host "============================================================"
+ 
+ 
+# Fail Jenkins only for actual API/system errors.
+# Unauthorized MRs being found and successfully closed
+# are NOT considered job failures.
+ 
+if ($Errors -gt 0) {
+ 
+    Write-Error "Job completed with $Errors error(s)."
+ 
+    exit 1
+}
+ 
+Write-Host ""
+Write-Host "Merge Request governance check completed successfully."
+ 
+exit 0
+ 
