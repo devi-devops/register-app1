@@ -1,0 +1,138 @@
+$GroupInput = $env:GROUP_NAMES
+ 
+if ([string]::IsNullOrWhiteSpace($GroupInput)) {
+    Write-Error "GROUP_NAMES is empty. Provide one or more group names separated by commas."
+    exit 1
+}
+ 
+$GroupNames = @(
+    $GroupInput.Split(',') |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    Select-Object -Unique
+)
+ 
+Write-Host "Groups provided: $($GroupNames -join ', ')"
+ 
+ 
+function Get-GitLabGroupId {
+ 
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$GroupName
+    )
+ 
+    Write-Host "Resolving Group: $GroupName"
+ 
+    $EncodedGroupName = [System.Uri]::EscapeDataString($GroupName)
+ 
+    $Url = "$GitLabUrl/api/v4/groups?search=$EncodedGroupName&per_page=100"
+ 
+    try {
+ 
+        $Groups = @(
+            Invoke-RestMethod `
+                -Method Get `
+                -Uri $Url `
+                -Headers $Headers `
+                -ErrorAction Stop
+        )
+ 
+        #
+        # Search can return partial matches.
+        # Therefore get the exact matching group.
+        #
+        $MatchedGroup = @(
+            $Groups | Where-Object {
+                $_.name -ieq $GroupName -or
+                $_.path -ieq $GroupName -or
+                $_.full_path -ieq $GroupName
+            }
+        )
+ 
+        if ($MatchedGroup.Count -eq 0) {
+ 
+            Write-Warning "Group not found: $GroupName"
+ 
+            return $null
+        }
+ 
+        if ($MatchedGroup.Count -gt 1) {
+ 
+            Write-Warning "Multiple groups matched: $GroupName"
+ 
+            foreach ($Group in $MatchedGroup) {
+ 
+                Write-Host "ID        : $($Group.id)"
+                Write-Host "Name      : $($Group.name)"
+                Write-Host "Full Path : $($Group.full_path)"
+                Write-Host ""
+            }
+ 
+            Write-Warning "Skipping $GroupName because the group name is ambiguous."
+ 
+            return $null
+        }
+ 
+        Write-Host "Group found:"
+        Write-Host "Name      : $($MatchedGroup[0].name)"
+        Write-Host "Full Path : $($MatchedGroup[0].full_path)"
+        Write-Host "Group ID  : $($MatchedGroup[0].id)"
+ 
+        return $MatchedGroup[0].id
+    }
+    catch {
+ 
+        Write-Warning "Failed to resolve Group: $GroupName"
+        Write-Warning $_.Exception.Message
+ 
+        return $null
+    }
+}
+ 
+ 
+$Projects = @()
+ 
+foreach ($GroupName in $GroupNames) {
+ 
+    Write-Host ""
+    Write-Host "============================================================"
+    Write-Host "Processing Group: $GroupName"
+    Write-Host "============================================================"
+ 
+    # Resolve Group Name -> Group ID
+    $GroupId = Get-GitLabGroupId -GroupName $GroupName
+ 
+    if ($null -eq $GroupId) {
+ 
+        $Errors++
+ 
+        Write-Warning "Skipping Group: $GroupName"
+ 
+        continue
+    }
+ 
+    # Get all projects under the group
+    try {
+ 
+        $GroupProjects = @(
+            Get-GitLabGroupProjects -GroupId $GroupId
+        )
+ 
+        Write-Host ""
+        Write-Host "Group    : $GroupName"
+        Write-Host "Group ID : $GroupId"
+        Write-Host "Projects : $($GroupProjects.Count)"
+ 
+        $Projects += $GroupProjects
+    }
+    catch {
+ 
+        $Errors++
+ 
+        Write-Warning "Unable to retrieve projects for Group: $GroupName"
+        Write-Warning $_.Exception.Message
+ 
+        continue
+    }
+}
