@@ -1,0 +1,45 @@
+Jira and GitLab Integration
+Brief Integration Overview
+Purpose. Integrate Jira and GitLab so that Jira Stories, Tasks, Bugs, and Defects can be traced to the related GitLab development activity, including branches, commits, and merge requests.
+1. Integration Objective
+Provide direct visibility of GitLab development activity from the related Jira work item.
+Allow developers and reviewers to move between Jira and GitLab without manually searching repositories.
+Create traceability from a Jira requirement or defect to the code changes and merge request that implemented it.
+2. Correlation Between Jira and GitLab
+The Jira issue key, for example PAY-458, is used to associate GitLab activity with the Jira work item.
+The Jira key may be referenced in a branch name, commit message, merge request title, or merge request description.
+It is not universally mandatory to include the Jira key in every branch or every commit. The organization should define at least one reliable and consistently enforced correlation method.
+3. Recommended Working Convention
+GitLab object 	Recommendation 	Example 
+Branch 	Jira key optional, based on naming policy 	feature/payment-validation or feature/PAY-458-payment-validation 
+Commit 	Jira key optional unless commit-level traceability is required 	PAY-458 Fix payment validation 
+Merge Request 	Jira key recommended for clear work-item linkage 	PAY-458 - Payment validation changes 
+MR description 	Include Jira key or Jira link and change summary 	Implements PAY-458 
+4. Information Available Through the Integration
+Branches associated with the Jira issue.
+Commits that reference the Jira issue key.
+Merge requests associated with the Jira issue.
+Merge request status, such as Open, Merged, or Closed.
+Reviewer and approval information where supported by the selected Jira/GitLab integration.
+Links from Jira to the relevant GitLab objects and from GitLab references back to Jira.
+5. Integration Methods
+Native integration: Configure the supported Jira-GitLab connector or application to display development information in Jira.
+REST APIs: Use Jira and GitLab APIs when complete history, reporting, validation, or audit extraction is required beyond the standard user interface.
+Webhooks: Use GitLab push, merge request, and pipeline events when custom near-real-time Jira updates are required.
+6. Example
+Jira issue: PAY-458 - Payment validation defect.
+Branch: feature/payment-validation.
+Commits: PAY-458 Fix validation logic; PAY-458 Add unit tests.
+Merge request: PAY-458 - Payment validation fix.
+Result: Jira displays or links the related GitLab development activity for PAY-458.
+7. Key Decision
+The Jira issue ID is not inherently mandatory in every GitLab commit or branch name.
+If the organization requires exact commit-level traceability, placing the Jira key in each commit message is a strong control.
+If linkage through the merge request is sufficient, the Jira key can be mandatory only in the MR title or description, while branch and commit naming remain optional.
+The selected rule should be validated against the actual Jira and GitLab versions and enforced consistently through team standards or repository checks.
+8. Recommended Minimum Standard
+Every code change must be traceable to a Jira work item.
+The Jira key should be mandatory in the merge request title or description.
+Branch and commit references should remain optional unless audit requirements demand branch-level or commit-level traceability.
+Use API-based reporting when a complete, long-term history is required.
+Summary: The integration should provide reliable Jira-to-GitLab traceability without imposing unnecessary naming rules. The mandatory point is the traceability outcome; where the Jira key must appear is a governance decision based on the required level of detail.
